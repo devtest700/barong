@@ -20,6 +20,8 @@ describe '/api/v2/auth functionality test' do
   describe 'testing workability with session' do
     context 'with valid session' do
       before do
+        permission = Permission.new(role: 'member', req_type: 'get', path: '/api/v2/resource/users/me')
+        allow(Permission).to receive(:find_by_role_and_req_type_and_path).and_return(permission)
         do_create_session_request
       end
 
@@ -196,6 +198,11 @@ describe '/api/v2/auth functionality test' do
     end
 
     context 'testing api key with valid params' do
+      before do
+        permission = Permission.new(role: 'member', req_type: 'get', path: '/api/v2/resource/users/me')
+        allow(Permission).to receive(:find_by_role_and_req_type_and_path).and_return(permission)
+      end
+
       it 'catches api key headers and renders error on blank header' do
         get auth_request, headers: {
           'X-Auth-Apikey' => kid,
@@ -240,6 +247,173 @@ describe '/api/v2/auth functionality test' do
         expect(response.status).to eq(200)
         expect(response.body).to be_empty
         expect(response.headers['Authorization']).to be_nil
+      end
+    end
+  end
+
+  describe 'testing rbac workability' do
+    let!(:accountant_user) { create(:user, state: 'active', role: 'accountant') }
+    let!(:admin_user) {create(:user, state: 'active', role: 'admin', otp: true) }
+    let(:accountant_params) do { email: accountant_user.email, password: accountant_user.password } end
+    let(:admin_params) do { email: admin_user.email, password: admin_user.password, otp_code: '1357' } end
+    let(:do_create_session_request_acc) { post uri, params: accountant_params }
+    let(:do_create_session_request_adm) { post uri, params: admin_params }
+
+    let(:otp_enabled) { true }
+    let!(:admin_api_key) { create :api_key, user: admin_user }
+
+    let(:otp_code) { '1357' }
+    let(:nonce) { Time.now.to_i }
+    let(:adm_kid) { admin_api_key.kid }
+    let(:secret) { SecureRandom.hex(16) }
+    let(:adm_data) { nonce.to_s + adm_kid }
+    let(:algorithm) { 'SHA' + admin_api_key.algorithm[2..4]}
+    let(:signature) { OpenSSL::HMAC.hexdigest(algorithm, secret, adm_data) }
+
+    let(:logger) { Logger.new('/dev/null') }
+    let(:seeder) { Barong::Seed.new }
+    let(:seeds) { { "permissions" => permissions } }
+
+    let(:permissions) {
+      [
+        {
+          "role" => "admin",
+          "req_type" => "GET",
+          "path" => "api/v2/admin/users/list"
+        },
+        {
+          "role" => "accountant",
+          "req_type" => "POST",
+          "path" => "api/v2/accountant/documents"
+        }
+      ]
+    }
+
+    before do
+      SecretStorage.store_secret(secret, admin_api_key.kid)
+      allow(TOTPService).to receive(:validate?)
+        .with(admin_user.uid, otp_code) { true }
+      allow(SecretStorage).to receive(:get_secret)
+        .with(adm_kid) { Vault::Secret.new(data: { value: secret }) }
+
+      Permission.delete_all
+      allow(seeder).to receive(:seeds).and_return(seeds)
+      allow(seeder).to receive(:logger).and_return(logger)
+
+      seeder.seed_permissions
+    end
+
+    context 'with cookies' do
+      context 'not enough permissions' do
+        it 'denies access for user with invalid cookies' do
+          get auth_request
+          expect(response.status).to eq(401)
+          expect(response.body).to eq("{\"errors\":[\"authz.invalid_session\"]}")
+        end
+
+        it 'denies access for non-accountant user with valid cookies trying to GET accountant api' do
+          do_create_session_request_adm
+
+          get '/api/v2/auth/api/v2/accountant/documents'
+          expect(response.status).to eq(401)
+          expect(response.body).to eq("{\"errors\":[\"authz.invalid_permission\"]}")
+          expect(response.headers['Authorization']).to be_nil
+        end
+
+        it 'denies POST for endpoint but allowing GET for admin user according to permissions' do
+          do_create_session_request_adm
+
+          post '/api/v2/auth/api/v2/admin/users/list'
+          expect(response.status).to eq(401)
+          expect(response.body).to eq("{\"errors\":[\"authz.invalid_permission\"]}")
+          expect(response.headers['Authorization']).to be_nil
+
+          get '/api/v2/auth/api/v2/admin/users/list'
+          expect(response.status).to eq(200)
+          expect(response.headers['Authorization']).not_to be_nil
+          expect(response.headers['Authorization']).to include "Bearer"
+        end
+
+        it 'denies access because of the typo in the path' do
+          do_create_session_request_adm
+          get '/api/v2/auth/api/v2/admon/users/list'
+          expect(response.status).to eq(401)
+          expect(response.body).to eq("{\"errors\":[\"authz.invalid_permission\"]}")
+
+          get '/api/v2/auth/api/v2/admin/users/list'
+          expect(response.status).to eq(200)
+          expect(response.headers['Authorization']).not_to be_nil
+          expect(response.headers['Authorization']).to include "Bearer"
+        end
+      end
+
+      context 'enough permissions' do
+        it 'allowes access with for user with valid cookies, req_type, role and path' do
+          do_create_session_request_adm
+
+          get '/api/v2/auth/api/v2/admin/users/list'
+          expect(response.status).to eq(200)
+          expect(response.headers['Authorization']).not_to be_nil
+          expect(response.headers['Authorization']).to include "Bearer"
+
+          do_create_session_request_acc
+          post '/api/v2/auth/api/v2/accountant/documents'
+          expect(response.status).to eq(200)
+          expect(response.headers['Authorization']).not_to be_nil
+          expect(response.headers['Authorization']).to include "Bearer"
+        end
+      end
+    end
+
+    context 'with api_keys' do
+      context 'with valid api key headers' do
+        context 'enough permissions' do
+          it 'allowes access with for api key owner for valid req_type, owner role and path' do
+            get '/api/v2/auth/api/v2/admin/users/list', headers: {
+              'X-Auth-Apikey' => adm_kid,
+              'X-Auth-Nonce' => nonce,
+              'X-Auth-Signature' => signature
+            }
+
+            expect(response.status).to eq(200)
+            expect(response.headers['Authorization']).not_to be_nil
+            expect(response.headers['Authorization']).to include "Bearer"
+          end
+        end
+
+        context 'not enough permissions' do
+          it 'denies access for non-accountant api key owner with valid cookies trying to GET accountant api' do
+            post '/api/v2/auth/api/v2/accountant/documents', headers: {
+              'X-Auth-Apikey' => adm_kid,
+              'X-Auth-Nonce' => nonce,
+              'X-Auth-Signature' => signature
+            }
+
+            expect(response.status).to eq(401)
+            expect(response.body).to eq("{\"errors\":[\"authz.invalid_permission\"]}")
+          end
+
+          it 'denies POST for endpoint but allowing GET for api key owner according to permissions' do
+            post '/api/v2/auth/api/v2/accountant/documents', headers: {
+              'X-Auth-Apikey' => adm_kid,
+              'X-Auth-Nonce' => nonce,
+              'X-Auth-Signature' => signature
+            }
+
+            expect(response.status).to eq(401)
+            expect(response.body).to eq("{\"errors\":[\"authz.invalid_permission\"]}")
+
+            get '/api/v2/auth/api/v2/admin/users/list', headers: {
+              'X-Auth-Apikey' => adm_kid,
+              'X-Auth-Nonce' => nonce,
+              'X-Auth-Signature' => signature
+            }
+
+            expect(response.status).to eq(200)
+            expect(response.headers['Authorization']).not_to be_nil
+            expect(response.headers['Authorization']).to include "Bearer"
+          end
+        end
       end
     end
   end

@@ -37,11 +37,13 @@ describe Barong::Seed do
       }
     ]
   }
+  let(:permissions) {[]}
   let(:users) {[]}
   let(:seeds) {
     {
       "users" => users,
-      "levels" => levels   
+      "levels" => levels,
+      "permissions" => permissions
     }
   }
 
@@ -53,6 +55,7 @@ describe Barong::Seed do
     allow(seeder).to receive(:logger).and_return(logger)
     Level.delete_all
     User.delete_all
+    Permission.delete_all
   end
 
   context "Seed simple and valid levels" do
@@ -243,6 +246,92 @@ describe Barong::Seed do
       expect(admin.role).to eq("member")
       expect(admin.state).to eq("active")
       expect(admin.level).to eq(2)
+    end
+  end
+
+  context "Seed simple GET /me member permissions" do
+    let(:permissions) {
+      [
+        {
+          "role" => "member",
+          "req_type" => "GET",
+          "path" => "api/v2/resource/users/me"
+        }
+      ]
+    }
+
+    it "seeds permissions in database" do
+      seeder.seed_permissions
+      expect(Permission.count).to eq 1
+      permission = Permission.first
+      expect(permission.role).to eq("member")
+      expect(permission.req_type).to eq("GET")
+      expect(permission.path).to eq("api/v2/resource/users/me")
+    end
+  end
+
+  context "Permission req_type is not set" do
+    let(:permissions) {
+      [
+        {
+          "role" => "member",
+          "path" => "api/v2/resource/users/me"
+        }
+      ]
+    }
+
+    it "raises an explicit error" do
+      expect {
+        seeder.seed_permissions
+      }.to raise_error(Barong::Seed::ConfigError, "Can't create permission: Req type can't be blank")
+    end
+  end
+
+  context "Permission path is not set" do
+    let(:permissions) {
+      [
+        {
+          "role" => "member",
+          "req_type" => "GET"
+        }
+      ]
+    }
+    it "raises an explicit error" do
+      expect {
+        seeder.seed_permissions
+      }.to raise_error(Barong::Seed::ConfigError, "Can't create permission: Path can't be blank")
+    end
+  end
+
+  context "Seed one admin GET and one accountant POST permissions" do
+    let(:permissions) {
+      [
+        {
+          "role" => "admin",
+          "req_type" => "GET",
+          "path" => "api/v2/admin/users/list"
+        },
+        {
+          "role" => "accountant",
+          "req_type" => "POST",
+          "path" => "api/v2/admin/users"
+        }
+      ]
+    }
+
+    it "seeds permissions in database" do
+      seeder.seed_permissions
+      expect(Permission.count).to eq 2
+
+      admin_permission = Permission.find_by_role('admin')
+      expect(admin_permission.role).to eq("admin")
+      expect(admin_permission.req_type).to eq("GET")
+      expect(admin_permission.path).to eq("api/v2/admin/users/list")
+
+      accountant_permission = Permission.find_by_role('accountant')
+      expect(accountant_permission.role).to eq("accountant")
+      expect(accountant_permission.req_type).to eq("POST")
+      expect(accountant_permission.path).to eq("api/v2/admin/users")
     end
   end
 end
